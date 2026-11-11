@@ -204,9 +204,9 @@ FFmpeg, with the STREAMINFO MD5 signature `flac -t` checks):
   VERBATIM subframes handle silence and incompressible blocks.
 - **8/16/24-bit**, up to **8 channels**, any sample rate; interleaved or
   planar `i32` input, plus zero-copy-friendly `s16le`/`f32le` byte ingest.
-- **32-bit** (FLAC 1.4 extension), first cut: channels coded independently
-  with CONSTANT / FIXED (orders 0..4, i64) / VERBATIM subframes; no LPC or
-  stereo decorrelation yet.
+- **32-bit** (FLAC 1.4 extension): LPC (15-bit coefficients) / FIXED /
+  VERBATIM in i64 arithmetic, channels coded independently (no stereo
+  decorrelation yet).
 - **`EncodeStats`** wiring-audit counters on every decision path — a corpus
   run proves no path is silently dead and no fallback is silently hot.
 - **Chunked streams**: `Encoder::finish_and_reset` closes one complete stream
@@ -409,8 +409,8 @@ the host side with `--features libm` too when you want that guarantee.
 - [x] **Microcontroller-ready encode**: integer autocorrelation, static windows,
       byte-gated peak heap, `finish_and_reset` for chunked streams (0.2.0)
 - [ ] Streaming encode API (fixed-latency block push, bounded memory)
-- [x] 32-bit encode, first cut (independent channels, FIXED / VERBATIM)
-- [ ] 32-bit encode: LPC and stereo decorrelation (33-bit side channel)
+- [x] 32-bit encode: LPC / FIXED / VERBATIM, independent channels
+- [ ] 32-bit encode: stereo decorrelation (33-bit side channel)
 - [ ] Seek-table and metadata (Vorbis comment / picture) blocks
 - [ ] ffmpeg-style level→work-point mapping for L0–L5 (today the level knob
       maps to LPC order only, so our L0 is ~10% smaller but slower than

@@ -41,6 +41,19 @@ fn gen(kind: &str, n: usize, ch: usize) -> Vec<Vec<i32>> {
                             (((t * 440.0 * std::f64::consts::TAU + ph).sin() * 8_000_000.0) as i32)
                                 << 8
                         }
+                        // clean near-full-scale sine: LPC territory, and close
+                        // enough to 2^31 that some predictors overshoot the
+                        // 30-bit residual limit and must be skipped
+                        "full_sine" => {
+                            ((t * 1234.5 * std::f64::consts::TAU + ph).sin() * 2147483000.0) as i32
+                        }
+                        // smooth, quiet, odd LSBs: LPC on 25-bit-ish values
+                        "smooth" => {
+                            (((t * 211.0 * std::f64::consts::TAU + ph).sin()
+                                + 0.3 * (t * 3301.0 * std::f64::consts::TAU).sin())
+                                * 1.0e7) as i32
+                                | 1
+                        }
                         // 20-bit noise, odd LSBs (no wasted bits): FIXED order 0
                         "quiet_noise" => (lcg(&mut seed) & 0xF_FFFF) as i32 - 0x8_0000,
                         "white" => {
@@ -77,6 +90,8 @@ fn roundtrip_and_files() {
         "silence",
         "const",
         "wasted24",
+        "full_sine",
+        "smooth",
         "quiet_noise",
         "white",
     ];
@@ -89,27 +104,33 @@ fn roundtrip_and_files() {
             (44100, 5, 2),
             (96000, 8192, 1),
             (48000, 5000, 3),
+            (44100, 4096 + 17, 2),
+            (44100, 4096 + 32, 1),
         ] {
             let planes = gen(kind, n, ch);
-            let mut enc = Encoder::new(rate, ch as u32, 32).unwrap();
             let refs: Vec<&[i32]> = planes.iter().map(|v| v.as_slice()).collect();
-            enc.push_planar(&refs).unwrap();
-            let flac = enc.finish();
-            let (info, out) = decode(&flac).unwrap();
-            assert_eq!(info.sample_rate, rate);
-            assert_eq!(out, planes, "{kind} {rate} {n} {ch}");
-            if let Some(d) = &dir {
-                std::fs::write(format!("{d}/{kind}_{rate}_{n}_{ch}.flac"), &flac).unwrap();
-                let mut raw = Vec::new();
-                for i in 0..n {
-                    for plane in &planes {
-                        raw.extend_from_slice(&plane[i].to_le_bytes());
+            for level in [0u32, 5, 8] {
+                let mut enc = Encoder::new(rate, ch as u32, 32).unwrap();
+                enc.set_compression_level(level);
+                enc.push_planar(&refs).unwrap();
+                let flac = enc.finish();
+                let (info, out) = decode(&flac).unwrap();
+                assert_eq!(info.sample_rate, rate);
+                assert_eq!(out, planes, "{kind} {rate} {n} {ch} L{level}");
+                if let Some(d) = &dir {
+                    let name = format!("{d}/{kind}_{rate}_{n}_{ch}_L{level}");
+                    std::fs::write(format!("{name}.flac"), &flac).unwrap();
+                    let mut raw = Vec::new();
+                    for i in 0..n {
+                        for plane in &planes {
+                            raw.extend_from_slice(&plane[i].to_le_bytes());
+                        }
                     }
+                    std::fs::write(format!("{name}.s32"), raw).unwrap();
                 }
-                std::fs::write(format!("{d}/{kind}_{rate}_{n}_{ch}.s32"), raw).unwrap();
-            }
-            if n == 20000 && ch == 2 && rate == 44100 {
-                eprintln!("{kind} 20000x2: {} bytes of {}", flac.len(), n * 8);
+                if n == 20000 && ch == 2 && rate == 44100 {
+                    eprintln!("{kind} 20000x2 L{level}: {} bytes of {}", flac.len(), n * 8);
+                }
             }
         }
     }

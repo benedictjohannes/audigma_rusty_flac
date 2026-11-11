@@ -25,6 +25,11 @@ use crate::math;
 const BLOCK_SIZE: usize = 4096;
 /// Quantized LPC coefficient precision in bits.
 const LPC_PRECISION: u32 = 14;
+/// Quantized LPC coefficient precision on the wide (32-bit) path: one bit
+/// more, the format's maximum (libFLAC's choice at high bit depths). At
+/// 32-bit amplitude the coefficient rounding error shows up in the residual
+/// directly, so the extra coefficient bit pays for itself many times over.
+const WIDE_LPC_PRECISION: u32 = 15;
 /// Highest LPC order searched — subset-compliant.
 pub(crate) const LPC_MAX_ORDER: usize = 12;
 /// Rice parameters searched. Method 0 (4-bit params) covers k 0..=14; method
@@ -496,7 +501,7 @@ impl Encoder {
                 .map(|c| {
                     let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
                     let choice = if bps > 24 {
-                        analyze_wide(&arm, stats, scratch)
+                        analyze_wide(&arm, max_lpc_order, wins, stats, scratch)
                     } else {
                         analyze_subframe(&arm, max_lpc_order, wins, stats, scratch)
                     };
@@ -1194,7 +1199,7 @@ fn autocorrelation(
     let b = (62 - lg) / 2;
     let big = samples.iter().fold(0u32, |a, &s| a | s.unsigned_abs());
     let sh = (u32::BITS - big.leading_zeros() + WIN_Q).saturating_sub(b);
-    // |s| < 2^25 (24-bit + side), q ≤ 2^15: every s·q fits i64 with room.
+    // |s| <= 2^31 (32-bit encode), q <= 2^15: every s·q fits i64 with room.
     w.extend(
         samples[..h]
             .iter()
@@ -1614,6 +1619,8 @@ fn lpc_residual_scalar(
 /// A complete LPC subframe candidate + its total bit cost.
 struct LpcCandidate {
     order: usize,
+    /// Coefficient precision in bits (the subframe's `qlp precision`).
+    precision: u32,
     qlp: Vec<i32>,
     shift: i32,
     res: Vec<i32>,
@@ -1750,6 +1757,7 @@ fn realize_lpc(
         8 + order as u64 * bps as u64 + 4 + 5 + order as u64 * LPC_PRECISION as u64 + 6 + plan.bits;
     Some(LpcCandidate {
         order,
+        precision: LPC_PRECISION,
         qlp,
         shift,
         res,
@@ -2316,10 +2324,10 @@ fn write_subframe_from(
             for &s in &samples[..c.order] {
                 bw.write_signed(s as i64, bps); // warm-up
             }
-            bw.write_bits((LPC_PRECISION - 1) as u64, 4); // qlp precision - 1
+            bw.write_bits((c.precision - 1) as u64, 4); // qlp precision - 1
             bw.write_bits(c.shift as u64 & 0x1F, 5); // shift (non-negative, 5-bit)
             for &q in &c.qlp {
-                bw.write_signed(q as i64, LPC_PRECISION); // coefficients, qlp[0] first
+                bw.write_signed(q as i64, c.precision); // coefficients, qlp[0] first
             }
             bw.write_bits(c.plan.method as u64, 2);
             bw.write_bits(c.plan.partition_order as u64, 4);
@@ -2328,13 +2336,178 @@ fn write_subframe_from(
     }
 }
 
-/// Subframe choice for bit depths above 24 (no LPC, no stereo decorrelation,
-/// so every value stays within 32 bits): CONSTANT, FIXED order 0..=4 computed
-/// in i64, or VERBATIM. A FIXED order is only eligible when every residual
-/// fits in 30 bits, which keeps the i32 Rice machinery exact.
+// ---------------------------------------------------------------------------
+// Wide (32-bit) subframes
+// ---------------------------------------------------------------------------
+//
+// Above 24 bits the narrow kernels' bounds (|sample| < 2^25, i32 residual
+// arithmetic, the AVX2 exactness guards) no longer hold, so the wide path has
+// its own residual code: predictions in i64, and a candidate is eligible only
+// when every residual fits 30 bits (|r| < 2^30), which keeps the i32 Rice
+// machinery (zigzag, shifted sums, `write_rice`) exact. The analysis that is
+// bit-depth independent is shared: windowed autocorrelation (exact for
+// |sample| <= 2^31, see `autocorrelation`), Levinson, quantization and the
+// partition planner. Nothing here runs for bps <= 24.
+
+/// Largest residual magnitude (exclusive) the wide path codes.
+const WIDE_RES_LIMIT: u64 = 1 << 30;
+
+/// |residual| sums of the FIXED orders 0..=4, in i64 (the narrow
+/// [`fixed_sums_scalar`] runs its steady state in i32).
+fn fixed_sums_wide(samples: &[i32]) -> [u64; 5] {
+    let mut sums = [0u64; 5];
+    let x = |i: usize| samples[i] as i64;
+    for i in 0..samples.len() {
+        sums[0] += x(i).unsigned_abs();
+        if i >= 1 {
+            sums[1] += (x(i) - x(i - 1)).unsigned_abs();
+        }
+        if i >= 2 {
+            sums[2] += (x(i) - 2 * x(i - 1) + x(i - 2)).unsigned_abs();
+        }
+        if i >= 3 {
+            sums[3] += (x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3)).unsigned_abs();
+        }
+        if i >= 4 {
+            sums[4] +=
+                (x(i) - 4 * x(i - 1) + 6 * x(i - 2) - 4 * x(i - 3) + x(i - 4)).unsigned_abs();
+        }
+    }
+    sums
+}
+
+/// The FIXED residual of one order in i64, or `None` if any residual reaches
+/// [`WIDE_RES_LIMIT`].
+fn fixed_residual_wide(samples: &[i32], order: usize) -> Option<Vec<i32>> {
+    let x = |i: usize| samples[i] as i64;
+    let mut res = Vec::with_capacity(samples.len() - order);
+    for i in order..samples.len() {
+        let r = match order {
+            0 => x(i),
+            1 => x(i) - x(i - 1),
+            2 => x(i) - 2 * x(i - 1) + x(i - 2),
+            3 => x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3),
+            _ => x(i) - 4 * x(i - 1) + 6 * x(i - 2) - 4 * x(i - 3) + x(i - 4),
+        };
+        if r.unsigned_abs() >= WIDE_RES_LIMIT {
+            return None;
+        }
+        res.push(r as i32);
+    }
+    Some(res)
+}
+
+/// The LPC residual in i64, or `None` if any residual reaches
+/// [`WIDE_RES_LIMIT`]. Every product is below 2^31 · 2^13 and a sum of at
+/// most 32 of them below 2^49, so the i64 accumulation is exact; the decoder
+/// forms the same `sum >> shift`.
+fn lpc_residual_wide(samples: &[i32], qlp: &[i32], shift: i32) -> Option<Vec<i32>> {
+    #[inline(always)]
+    fn run<const ORDER: usize>(samples: &[i32], qlp: &[i32], shift: i32) -> Option<Vec<i32>> {
+        let mut coeffs = [0i64; 32];
+        for (c, &q) in coeffs.iter_mut().zip(qlp) {
+            *c = q as i64;
+        }
+        let mut res = Vec::with_capacity(samples.len() - ORDER);
+        for i in ORDER..samples.len() {
+            let mut sum = 0i64;
+            for j in 0..ORDER {
+                sum += coeffs[j] * samples[i - 1 - j] as i64;
+            }
+            let r = samples[i] as i64 - (sum >> shift);
+            if r.unsigned_abs() >= WIDE_RES_LIMIT {
+                return None;
+            }
+            res.push(r as i32);
+        }
+        Some(res)
+    }
+    match qlp.len() {
+        1 => run::<1>(samples, qlp, shift),
+        2 => run::<2>(samples, qlp, shift),
+        3 => run::<3>(samples, qlp, shift),
+        4 => run::<4>(samples, qlp, shift),
+        5 => run::<5>(samples, qlp, shift),
+        6 => run::<6>(samples, qlp, shift),
+        7 => run::<7>(samples, qlp, shift),
+        8 => run::<8>(samples, qlp, shift),
+        9 => run::<9>(samples, qlp, shift),
+        10 => run::<10>(samples, qlp, shift),
+        11 => run::<11>(samples, qlp, shift),
+        12 => run::<12>(samples, qlp, shift),
+        order => {
+            let mut res = Vec::with_capacity(samples.len() - order);
+            for i in order..samples.len() {
+                let sum: i64 = qlp
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &c)| c as i64 * samples[i - 1 - j] as i64)
+                    .sum();
+                let r = samples[i] as i64 - (sum >> shift);
+                if r.unsigned_abs() >= WIDE_RES_LIMIT {
+                    return None;
+                }
+                res.push(r as i32);
+            }
+            Some(res)
+        }
+    }
+}
+
+/// Why a wide LPC candidate could not be realized.
+enum WideLpcFail {
+    /// Quantization left no predictive power.
+    Degenerate,
+    /// Some residual reaches [`WIDE_RES_LIMIT`].
+    TooWide,
+}
+
+/// [`realize_lpc`] on the wide path: quantize, i64 residual, partition plan.
+fn realize_lpc_wide(
+    samples: &[i32],
+    bps: u32,
+    est: &LpcEstimate,
+    stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
+) -> Result<LpcCandidate, WideLpcFail> {
+    let n = samples.len();
+    let order = est.order;
+    let Some((qlp, shift)) = quantize_lpc(&est.coeffs, WIDE_LPC_PRECISION) else {
+        stats.lpc_quantize_failed += 1;
+        return Err(WideLpcFail::Degenerate);
+    };
+    let res = lpc_residual_wide(samples, &qlp, shift).ok_or(WideLpcFail::TooWide)?;
+    let plan = plan_partitions(&res, n, order, scratch);
+    let bits = 8
+        + order as u64 * bps as u64
+        + 4
+        + 5
+        + order as u64 * WIDE_LPC_PRECISION as u64
+        + 6
+        + plan.bits;
+    Ok(LpcCandidate {
+        order,
+        precision: WIDE_LPC_PRECISION,
+        qlp,
+        shift,
+        res,
+        plan,
+        bits,
+    })
+}
+
+/// Subframe choice for bit depths above 24 (no stereo decorrelation, so every
+/// value stays within 32 bits): CONSTANT, LPC (both windows, order capped by
+/// the compression level), FIXED 0..=4, or VERBATIM. Same selection rules as
+/// the narrow path: the estimated LPC window winner is realized (and a
+/// runner-up within [`WINDOW_EST_MARGIN`]); FIXED is realized only when its
+/// estimate is within 10% of the best so far. LPC or FIXED candidates whose
+/// residuals do not fit 30 bits are skipped.
 fn analyze_wide(
     arm: &ArmInput<'_>,
-    _stats: &mut EncodeStats,
+    max_lpc_order: usize,
+    wins: &WindowCache,
+    stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
 ) -> SubframeChoice {
     let samples: &[i32] = &arm.samples;
@@ -2355,27 +2528,77 @@ fn analyze_wide(
         wasted: arm.wasted,
         kind: SubframeKind::Verbatim,
     };
-    for order in 0..=4usize.min(n.saturating_sub(1)) {
-        let x = |i: usize| samples[i] as i64;
-        let mut res = Vec::with_capacity(n - order);
-        let mut ok = true;
-        for i in order..n {
-            let r = match order {
-                0 => x(i),
-                1 => x(i) - x(i - 1),
-                2 => x(i) - 2 * x(i - 1) + x(i - 2),
-                3 => x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3),
-                _ => x(i) - 4 * x(i - 1) + 6 * x(i - 2) - 4 * x(i - 3) + x(i - 4),
-            };
-            if r.unsigned_abs() >= (1u64 << 30) {
-                ok = false;
-                break;
+
+    // LPC. A predictor whose residual does not fit 30 bits (a high order on
+    // near-full-scale content can overshoot) makes that candidate ineligible;
+    // if every window's candidate fails that way, the order cap is halved and
+    // the search re-run, so a level with a higher cap never ends up worse off
+    // than one with a lower cap merely because its first choice was too wide.
+    let mut max_order = max_lpc_order.min(n / 2);
+    while max_order >= 1 {
+        debug_assert_eq!(wins.n, n, "window cache not sized for this block");
+        let ests: Vec<Option<LpcEstimate>> = (0..WINDOW_ALPHAS.len())
+            .map(|k| lpc_estimate(samples, bps, max_order, wins.get(k), stats, &mut *scratch))
+            .collect();
+        let winner = ests
+            .iter()
+            .flatten()
+            .map(|e| e.est_bits)
+            .fold(f64::INFINITY, f64::min);
+        let mut lpc: Option<(usize, LpcCandidate)> = None;
+        let mut too_wide = false;
+        for (widx, est) in ests.iter().enumerate() {
+            let Some(est) = est else { continue };
+            if est.est_bits > winner * (1.0 + WINDOW_EST_MARGIN) {
+                continue; // clear loser: skip the expensive realization
             }
-            res.push(r as i32);
+            match realize_lpc_wide(samples, bps, est, stats, &mut *scratch) {
+                Ok(c) => {
+                    if lpc.as_ref().is_none_or(|(_, b)| c.bits < b.bits) {
+                        lpc = Some((widx, c));
+                    }
+                }
+                Err(WideLpcFail::TooWide) => too_wide = true,
+                Err(WideLpcFail::Degenerate) => {}
+            }
         }
-        if !ok {
+        if let Some((widx, c)) = lpc {
+            if c.bits + wb < best.bits {
+                if widx == 1 {
+                    stats.lpc_window_second_won += 1;
+                }
+                best = SubframeChoice {
+                    bits: c.bits + wb,
+                    wasted: arm.wasted,
+                    kind: SubframeKind::Lpc(Box::new(c)),
+                };
+            }
+            break;
+        }
+        if !too_wide {
+            break;
+        }
+        let tried = ests.iter().flatten().map(|e| e.order).max().unwrap_or(1);
+        max_order = tried / 2;
+    }
+
+    // FIXED, cheapest estimate first; a too-wide residual falls through to the
+    // next order. Stable sort: ties go to the lower order.
+    let sums = fixed_sums_wide(samples);
+    let mut orders: Vec<usize> = (0..=4usize.min(n - 1)).collect();
+    orders.sort_by_key(|&o| sums[o]);
+    for order in orders {
+        let est = 8
+            + wb
+            + order as u64 * bps as u64
+            + 6
+            + rice_bits_estimate(sums[order], (n - order) as u64);
+        if est > best.bits.saturating_add(best.bits / 10) {
+            break; // ascending estimates: no later order can win either
+        }
+        let Some(res) = fixed_residual_wide(samples, order) else {
             continue;
-        }
+        };
         let plan = plan_partitions(&res, n, order, scratch);
         let bits = 8 + wb + order as u64 * bps as u64 + 6 + plan.bits;
         if bits < best.bits {
@@ -2385,6 +2608,7 @@ fn analyze_wide(
                 kind: SubframeKind::Fixed { order, res, plan },
             };
         }
+        break;
     }
     best
 }
@@ -2514,6 +2738,62 @@ fn decide_stereo<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On content inside the narrow bounds (24-bit), the wide residuals equal
+    /// the narrow kernels' exactly: same predictor, same arithmetic result.
+    #[test]
+    fn wide_residuals_match_narrow_on_24_bit() {
+        let mut x = 3u64;
+        let s: Vec<i32> = (0..3000)
+            .map(|i| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((i as f64 * 0.05).sin() * 8.0e6) as i32 + ((x >> 50) as i32 & 0xFF) - 128
+            })
+            .collect();
+        let peak = s.iter().fold(0, |a, &v| a | v.unsigned_abs());
+        for order in 0..=4 {
+            assert_eq!(
+                fixed_residual_wide(&s, order).unwrap(),
+                fixed_residual(&s, order),
+                "fixed {order}"
+            );
+        }
+        let sums = fixed_sums_wide(&s);
+        assert_eq!(sums, fixed_sums_scalar(&s));
+        for order in 1..=LPC_MAX_ORDER {
+            for shift in [0, 9, 13] {
+                // Coefficients summing to about 1.0 at this shift, so the
+                // prediction stays near the signal and residuals fit 30 bits.
+                let one = 1i32 << shift;
+                let qlp: Vec<i32> = (0..order as i32)
+                    .map(|j| one / order as i32 + if j % 2 == 0 { 1 } else { -1 })
+                    .collect();
+                assert_eq!(
+                    lpc_residual_wide(&s, &qlp, shift).unwrap(),
+                    lpc_residual_scalar(&s, &qlp, shift, order, peak),
+                    "lpc order {order} shift {shift}"
+                );
+            }
+        }
+    }
+
+    /// A residual at or beyond 2^30 makes the wide candidate ineligible
+    /// instead of wrapping.
+    #[test]
+    fn wide_residuals_reject_beyond_30_bits() {
+        let s = [i32::MAX, i32::MIN, i32::MAX, i32::MIN, 0];
+        assert!(fixed_residual_wide(&s, 1).is_none());
+        assert!(lpc_residual_wide(&s, &[1], 0).is_none());
+        let long: Vec<i32> = (0..40)
+            .map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN })
+            .collect();
+        assert!(lpc_residual_wide(&long, &[1; 13], 0).is_none());
+        let edge = [0, (1 << 30) - 1, 0, -(1 << 30) + 1];
+        assert!(fixed_residual_wide(&edge, 0).is_some());
+        assert!(fixed_residual_wide(&[0, 1 << 30], 0).is_none());
+    }
 
     /// The tapers are the full-length window's non-1.0 samples in Q15, and
     /// every sample between them is exactly 1.0 — at every size a stream can
