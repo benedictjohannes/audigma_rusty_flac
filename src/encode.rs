@@ -46,7 +46,7 @@ pub enum EncodeError {
     TooManyChannels(u32),
     /// Zero channels.
     NoChannels,
-    /// Bits per sample outside the supported 8/16/24 set.
+    /// Bits per sample outside the supported 8/16/24/32 set.
     UnsupportedBps(u32),
     /// Sample rate must fit STREAMINFO's 20-bit field and be non-zero.
     BadSampleRate(u32),
@@ -2355,12 +2355,13 @@ fn analyze_wide(
         wasted: arm.wasted,
         kind: SubframeKind::Verbatim,
     };
-    for order in 1..=4usize.min(n.saturating_sub(1)) {
+    for order in 0..=4usize.min(n.saturating_sub(1)) {
         let x = |i: usize| samples[i] as i64;
         let mut res = Vec::with_capacity(n - order);
         let mut ok = true;
         for i in order..n {
             let r = match order {
+                0 => x(i),
                 1 => x(i) - x(i - 1),
                 2 => x(i) - 2 * x(i - 1) + x(i - 2),
                 3 => x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3),

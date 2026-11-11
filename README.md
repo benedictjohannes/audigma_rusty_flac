@@ -139,8 +139,8 @@ What changed:
 `rusty_flac` encodes and decodes FLAC in pure Rust — the full subset in both
 directions: FIXED and LPC prediction (orders to 12), all four stereo modes
 (independent, left/side, right/side, mid/side), **wasted-bits** detection,
-Rice and **Rice2** partitioned residuals with escape codes, 8/16/24-bit encode
-and 4–32-bit decode, up to 8 channels, CRC-8/CRC-16 verification, and the
+Rice and **Rice2** partitioned residuals with escape codes, 8/16/24/32-bit
+encode and 4–32-bit decode, up to 8 channels, CRC-8/CRC-16 verification, and the
 STREAMINFO MD5 audio signature. There is no C in the dependency tree — the
 only dependency is optional and pure Rust (`libm`, for `no_std` builds). It
 is a reimplementation of the
@@ -204,6 +204,9 @@ FFmpeg, with the STREAMINFO MD5 signature `flac -t` checks):
   VERBATIM subframes handle silence and incompressible blocks.
 - **8/16/24-bit**, up to **8 channels**, any sample rate; interleaved or
   planar `i32` input, plus zero-copy-friendly `s16le`/`f32le` byte ingest.
+- **32-bit** (FLAC 1.4 extension), first cut: channels coded independently
+  with CONSTANT / FIXED (orders 0..4, i64) / VERBATIM subframes; no LPC or
+  stereo decorrelation yet.
 - **`EncodeStats`** wiring-audit counters on every decision path — a corpus
   run proves no path is silently dead and no fallback is silently hot.
 - **Chunked streams**: `Encoder::finish_and_reset` closes one complete stream
@@ -406,7 +409,8 @@ the host side with `--features libm` too when you want that guarantee.
 - [x] **Microcontroller-ready encode**: integer autocorrelation, static windows,
       byte-gated peak heap, `finish_and_reset` for chunked streams (0.2.0)
 - [ ] Streaming encode API (fixed-latency block push, bounded memory)
-- [ ] 32-bit encode (FLAC 1.4 extension; decode already handles it)
+- [x] 32-bit encode, first cut (independent channels, FIXED / VERBATIM)
+- [ ] 32-bit encode: LPC and stereo decorrelation (33-bit side channel)
 - [ ] Seek-table and metadata (Vorbis comment / picture) blocks
 - [ ] ffmpeg-style level→work-point mapping for L0–L5 (today the level knob
       maps to LPC order only, so our L0 is ~10% smaller but slower than

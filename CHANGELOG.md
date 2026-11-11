@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encode)* 32-bit encode (sample-size code 7): channels coded independently
+  with CONSTANT, FIXED orders 0..=4 (i64 residuals, each within 30 bits) or
+  VERBATIM. 8/16/24-bit output is unchanged.
+
 ## [0.2.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.1...v0.2.2) - 2026-10-24
 
 ### Other

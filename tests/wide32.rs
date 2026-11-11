@@ -23,7 +23,7 @@ fn gen(kind: &str, n: usize, ch: usize) -> Vec<Vec<i32>> {
                             (v + (lcg(&mut seed) & 0xFFFF) - 0x8000) as i32
                         }
                         "loud_square" => {
-                            if (i / 50) % 2 == 0 {
+                            if ((i + 17 * c) / 50) % 2 == 0 {
                                 i32::MAX
                             } else {
                                 i32::MIN
@@ -38,8 +38,11 @@ fn gen(kind: &str, n: usize, ch: usize) -> Vec<Vec<i32>> {
                         "silence" => 0,
                         "const" => -123456789,
                         "wasted24" => {
-                            (((t * 440.0 * std::f64::consts::TAU).sin() * 8_000_000.0) as i32) << 8
+                            (((t * 440.0 * std::f64::consts::TAU + ph).sin() * 8_000_000.0) as i32)
+                                << 8
                         }
+                        // 20-bit noise, odd LSBs (no wasted bits): FIXED order 0
+                        "quiet_noise" => (lcg(&mut seed) & 0xF_FFFF) as i32 - 0x8_0000,
                         "white" => {
                             (lcg(&mut seed) as i32).wrapping_mul(4) ^ (lcg(&mut seed) as i32)
                         }
@@ -49,6 +52,19 @@ fn gen(kind: &str, n: usize, ch: usize) -> Vec<Vec<i32>> {
                 .collect()
         })
         .collect()
+}
+
+/// Uncorrelated noise with no wasted bits has nothing for a polynomial to
+/// predict: FIXED order 0 (Rice-coded samples) must win, at ~20 of 32 bits.
+#[test]
+fn quiet_noise_takes_fixed_order_0() {
+    let planes = gen("quiet_noise", 8192, 1);
+    let mut enc = Encoder::new(48000, 1, 32).unwrap();
+    enc.push_planar(&[&planes[0]]).unwrap();
+    let (flac, stats) = enc.finish_with_stats();
+    assert_eq!(stats.fixed_orders[0], stats.frames, "{stats:?}");
+    assert!(flac.len() < 8192 * 4 * 21 / 32, "{} bytes", flac.len());
+    assert_eq!(decode(&flac).unwrap().1, planes);
 }
 
 #[test]
@@ -61,6 +77,7 @@ fn roundtrip_and_files() {
         "silence",
         "const",
         "wasted24",
+        "quiet_noise",
         "white",
     ];
     for kind in kinds {
@@ -91,8 +108,8 @@ fn roundtrip_and_files() {
                 }
                 std::fs::write(format!("{d}/{kind}_{rate}_{n}_{ch}.s32"), raw).unwrap();
             }
-            if kind == "sine_noise" && n == 20000 && ch == 2 && rate == 44100 {
-                eprintln!("sine_noise 20000x2: {} bytes of {}", flac.len(), n * 8);
+            if n == 20000 && ch == 2 && rate == 44100 {
+                eprintln!("{kind} 20000x2: {} bytes of {}", flac.len(), n * 8);
             }
         }
     }
