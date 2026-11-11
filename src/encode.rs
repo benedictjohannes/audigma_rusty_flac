@@ -144,7 +144,7 @@ impl Encoder {
         if channels > 8 {
             return Err(EncodeError::TooManyChannels(channels));
         }
-        if !matches!(bits_per_sample, 8 | 16 | 24) {
+        if !matches!(bits_per_sample, 8 | 16 | 24 | 32) {
             return Err(EncodeError::UnsupportedBps(bits_per_sample));
         }
         if sample_rate == 0 || sample_rate >= (1 << 20) {
@@ -469,7 +469,7 @@ impl Encoder {
         // after the frame is written. Stereo's mid and side are computed, so
         // those subframes stay owned (`Cow::Owned`).
         let mut held_chans: Vec<Vec<i32>> = Vec::new();
-        let (assignment, subframes): (u64, Vec<Subframe<'_>>) = if self.channels == 2 {
+        let (assignment, subframes): (u64, Vec<Subframe<'_>>) = if self.channels == 2 && bps <= 24 {
             let (assignment, subs) = decide_stereo(
                 &self.chans[0][start..start + bs],
                 &self.chans[1][start..start + bs],
@@ -495,7 +495,11 @@ impl Encoder {
             let subs = (0..chans.len())
                 .map(|c| {
                     let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
-                    let choice = analyze_subframe(&arm, max_lpc_order, wins, stats, scratch);
+                    let choice = if bps > 24 {
+                        analyze_wide(&arm, stats, scratch)
+                    } else {
+                        analyze_subframe(&arm, max_lpc_order, wins, stats, scratch)
+                    };
                     let ebps = arm.ebps;
                     (arm.into_cow(), ebps, choice)
                 })
@@ -734,6 +738,7 @@ fn sample_size_code(bps: u32) -> u64 {
         16 => 4,
         20 => 5,
         24 => 6,
+        32 => 7,
         _ => 0,
     }
 }
@@ -2321,6 +2326,66 @@ fn write_subframe_from(
             write_partitioned_residual(bw, &c.res, samples.len(), c.order, &c.plan);
         }
     }
+}
+
+/// Subframe choice for bit depths above 24 (no LPC, no stereo decorrelation,
+/// so every value stays within 32 bits): CONSTANT, FIXED order 0..=4 computed
+/// in i64, or VERBATIM. A FIXED order is only eligible when every residual
+/// fits in 30 bits, which keeps the i32 Rice machinery exact.
+fn analyze_wide(
+    arm: &ArmInput<'_>,
+    _stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
+) -> SubframeChoice {
+    let samples: &[i32] = &arm.samples;
+    let bps = arm.ebps;
+    let wb = arm.wasted as u64;
+    let n = samples.len();
+    if let Some(&first) = samples.first() {
+        if samples.iter().all(|&v| v == first) {
+            return SubframeChoice {
+                bits: 8 + wb + bps as u64,
+                wasted: arm.wasted,
+                kind: SubframeKind::Constant(first),
+            };
+        }
+    }
+    let mut best = SubframeChoice {
+        bits: 8 + wb + n as u64 * bps as u64,
+        wasted: arm.wasted,
+        kind: SubframeKind::Verbatim,
+    };
+    for order in 1..=4usize.min(n.saturating_sub(1)) {
+        let x = |i: usize| samples[i] as i64;
+        let mut res = Vec::with_capacity(n - order);
+        let mut ok = true;
+        for i in order..n {
+            let r = match order {
+                1 => x(i) - x(i - 1),
+                2 => x(i) - 2 * x(i - 1) + x(i - 2),
+                3 => x(i) - 3 * x(i - 1) + 3 * x(i - 2) - x(i - 3),
+                _ => x(i) - 4 * x(i - 1) + 6 * x(i - 2) - 4 * x(i - 3) + x(i - 4),
+            };
+            if r.unsigned_abs() >= (1u64 << 30) {
+                ok = false;
+                break;
+            }
+            res.push(r as i32);
+        }
+        if !ok {
+            continue;
+        }
+        let plan = plan_partitions(&res, n, order, scratch);
+        let bits = 8 + wb + order as u64 * bps as u64 + 6 + plan.bits;
+        if bits < best.bits {
+            best = SubframeChoice {
+                bits,
+                wasted: arm.wasted,
+                kind: SubframeKind::Fixed { order, res, plan },
+            };
+        }
+    }
+    best
 }
 
 /// Choose the cheapest subframe type (CONSTANT / LPC / FIXED / VERBATIM) —
