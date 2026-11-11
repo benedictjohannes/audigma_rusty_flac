@@ -206,7 +206,9 @@ FFmpeg, with the STREAMINFO MD5 signature `flac -t` checks):
   planar `i32` input, plus zero-copy-friendly `s16le`/`f32le` byte ingest.
 - **32-bit** (FLAC 1.4 extension): LPC (15-bit coefficients) / FIXED /
   VERBATIM in i64 arithmetic, channels coded independently (no stereo
-  decorrelation yet).
+  decorrelation yet). Q30 windows, partial / punchout Tukey windows and an
+  exact quantized-predictor search: on a 384 kHz / 32-bit track, level 8 is
+  3.4 % smaller than `flac -8` (which has stereo).
 - **`EncodeStats`** wiring-audit counters on every decision path — a corpus
   run proves no path is silently dead and no fallback is silently hot.
 - **Chunked streams**: `Encoder::finish_and_reset` closes one complete stream

@@ -106,6 +106,10 @@ fn roundtrip_and_files() {
             (48000, 5000, 3),
             (44100, 4096 + 17, 2),
             (44100, 4096 + 32, 1),
+            // A tail of exactly twice the L8 order cap, and the smallest
+            // block that gets the segment windows.
+            (44100, 4096 + 24, 2),
+            (384000, 4096 + 256, 2),
         ] {
             let planes = gen(kind, n, ch);
             let refs: Vec<&[i32]> = planes.iter().map(|v| v.as_slice()).collect();

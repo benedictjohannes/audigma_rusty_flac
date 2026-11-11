@@ -389,6 +389,7 @@ impl Encoder {
         let mut frame_number = 0u64;
         let mut start = 0usize;
         let mut wins = core::mem::take(&mut self.wins);
+        wins.wide = bps > 24;
         // One frame writer, reused (cleared) for every frame instead of a
         // fresh allocation per frame. Sized to the raw ceiling of the largest
         // (first) block — blocks are non-increasing, and a lossless frame
@@ -493,6 +494,7 @@ impl Encoder {
             (assignment, subs)
         } else {
             let max_lpc_order = self.max_lpc_order;
+            let seg_windows = wide_seg_windows(max_lpc_order);
             held_chans = core::mem::take(&mut self.chans);
             let chans = &held_chans;
             let stats = &mut self.stats;
@@ -501,7 +503,7 @@ impl Encoder {
                 .map(|c| {
                     let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
                     let choice = if bps > 24 {
-                        analyze_wide(&arm, max_lpc_order, wins, stats, scratch)
+                        analyze_wide(&arm, max_lpc_order, seg_windows, wins, stats, scratch)
                     } else {
                         analyze_subframe(&arm, max_lpc_order, wins, stats, scratch)
                     };
@@ -560,27 +562,127 @@ const WINDOW_ALPHAS: [f64; 2] = [0.5, 0.2];
 /// multiply — the autocorrelation that follows is exact integer arithmetic.
 const WIN_Q: u32 = 15;
 
+/// The wide path's window scale. Q15 rounding error multiplies the signal by
+/// noise near 2^-16 in the tapers, a broadband floor about 100 dB under the
+/// signal; oversampled content (an empty band above the original
+/// bandwidth) needs a predictor that sees far deeper than that. Q30: a
+/// 31-bit sample times a Q30 window is below 2^61, still exact in i64.
+const WIDE_WIN_Q: u32 = 30;
+
 /// A Tukey window held as its two cosine tapers (Q15): `head` covers samples
 /// `0..head.len()`, `tail` the last `tail.len()`, and every sample between
 /// them is exactly `1 << WIN_Q` — so it is never stored.
 #[derive(Clone, Copy)]
-struct Window<'a> {
-    head: &'a [u16],
-    tail: &'a [u16],
+struct Window<'a, T = u16> {
+    head: &'a [T],
+    tail: &'a [T],
+}
+
+/// A window value's integer type and its fixed-point scale: Q15 `u16` on the
+/// narrow path, Q30 `u32` on the wide one.
+trait TaperWord: Copy {
+    /// Fractional bits: the flat middle is `1 << Q`.
+    const Q: u32;
+    fn widen(self) -> i64;
+}
+
+impl TaperWord for u16 {
+    const Q: u32 = WIN_Q;
+    #[inline(always)]
+    fn widen(self) -> i64 {
+        self as i64
+    }
+}
+
+impl TaperWord for u32 {
+    const Q: u32 = WIDE_WIN_Q;
+    #[inline(always)]
+    fn widen(self) -> i64 {
+        self as i64
+    }
 }
 
 /// Owned tapers of one window, for a block size with no static table.
-#[derive(Default)]
-struct Tapers {
-    head: Vec<u16>,
-    tail: Vec<u16>,
+struct Tapers<T = u16> {
+    head: Vec<T>,
+    tail: Vec<T>,
 }
 
-impl Tapers {
-    fn view(&self) -> Window<'_> {
+impl<T> Default for Tapers<T> {
+    fn default() -> Self {
+        Tapers {
+            head: Vec::new(),
+            tail: Vec::new(),
+        }
+    }
+}
+
+impl<T> Tapers<T> {
+    fn view(&self) -> Window<'_, T> {
         Window {
             head: &self.head,
             tail: &self.tail,
+        }
+    }
+}
+
+/// Segments of a block the wide path's extra windows are built from:
+/// `(d, i, j)` is samples `n·i/d .. n·j/d`, each under its own Tukey window
+/// ([`PIECE_ALPHA`]). A window that is zero outside a segment has the
+/// autocorrelation of that segment alone, so partial-Tukey windows need no new
+/// window type; and for lags shorter than a gap between two segments no
+/// product straddles it, so a punchout window's autocorrelation is the sum of
+/// its pieces'.
+const PIECES: [(usize, usize, usize); 7] = [
+    (2, 0, 1),
+    (2, 1, 2),
+    (3, 0, 1),
+    (3, 1, 2),
+    (3, 2, 3),
+    (3, 1, 3),
+    (3, 0, 2),
+];
+
+/// The wide path's extra windows, as the [`PIECES`] each sums: partial
+/// Tukey (2) and (3) (libFLAC's `partial_tukey`), then punchout Tukey (3)
+/// (the block with one third cut out).
+const SEG_WINDOWS: [&[usize]; 8] = [&[0], &[1], &[2], &[3], &[4], &[5], &[2, 4], &[6]];
+
+/// Taper fraction of each piece's own Tukey window: fully tapered (Hann).
+/// On a 384 kHz / 32-bit track, 0.5 gave +0.6% and 0.25 +1.6% larger output.
+const PIECE_ALPHA: f64 = 1.0;
+
+/// Smallest block the extra windows are tried on (a third of it is the
+/// shortest piece, which must hold far more samples than the LPC order).
+const SEG_MIN_BLOCK: usize = 256;
+
+/// The wide path's windows for one block size, all in Q30
+/// ([`WIDE_WIN_Q`]): the two full-block Tukey windows ([`WINDOW_ALPHAS`])
+/// and, for blocks of at least [`SEG_MIN_BLOCK`], the [`PIECES`]. Built at
+/// run time (once per block size), so unlike the narrow path's static
+/// full-block table they follow the build's `cos`; `--features libm` makes
+/// them identical everywhere.
+#[derive(Default)]
+struct WideWindows {
+    /// Block size this set is for (0: none).
+    n: usize,
+    full: [Tapers<u32>; 2],
+    /// Empty below [`SEG_MIN_BLOCK`].
+    pieces: Vec<Tapers<u32>>,
+}
+
+impl WideWindows {
+    fn build(&mut self, n: usize) {
+        self.n = n;
+        for (t, &alpha) in self.full.iter_mut().zip(&WINDOW_ALPHAS) {
+            *t = tukey_tapers_q(n, alpha, q30);
+        }
+        self.pieces.clear();
+        if n >= SEG_MIN_BLOCK {
+            for &(d, i, j) in &PIECES {
+                let len = n * j / d - n * i / d;
+                self.pieces.push(tukey_tapers_q(len, PIECE_ALPHA, q30));
+            }
         }
     }
 }
@@ -598,6 +700,11 @@ struct WindowCache {
     /// stream of the same length reuses them.
     short_n: usize,
     short: [Tapers; 2],
+    /// Wide path only (32-bit streams): the [`WideWindows`] for full blocks
+    /// and for the short final block.
+    wide: bool,
+    wide_full: WideWindows,
+    wide_short: WideWindows,
     /// Taper builds, for the reuse test: a cache that misses is otherwise
     /// invisible, the output being byte-identical either way.
     #[cfg(test)]
@@ -618,6 +725,27 @@ impl WindowCache {
                 *slot = tukey_tapers(n, alpha);
             }
         }
+        if self.wide {
+            let set = if self.full {
+                &mut self.wide_full
+            } else {
+                &mut self.wide_short
+            };
+            if set.n != n {
+                set.build(n);
+            }
+        }
+    }
+
+    /// The wide path's windows for the current block.
+    fn wide(&self) -> &WideWindows {
+        let set = if self.full {
+            &self.wide_full
+        } else {
+            &self.wide_short
+        };
+        debug_assert!(self.wide && set.n == self.n, "wide windows not built");
+        set
     }
 
     fn get(&self, k: usize) -> Window<'_> {
@@ -658,6 +786,16 @@ fn q15(w: f64) -> u16 {
 /// evaluated only where the window is not `1.0`. `x = i/(n-1)` is monotonic
 /// in `i`, so the head is a prefix and the tail a suffix.
 fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
+    tukey_tapers_q(n, alpha, q15)
+}
+
+/// A window value in `[0, 1]` as Q30, rounded half up (exact as for [`q15`]).
+fn q30(w: f64) -> u32 {
+    (w * (1u32 << WIDE_WIN_Q) as f64 + 0.5) as u32
+}
+
+/// [`tukey_tapers`] at any fixed-point scale `quant`.
+fn tukey_tapers_q<T>(n: usize, alpha: f64, quant: fn(f64) -> T) -> Tapers<T> {
     let mut t = Tapers::default();
     if n <= 1 {
         return t;
@@ -666,9 +804,9 @@ fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
     let mut i = 0;
     while i < n && x_of(i) < alpha / 2.0 {
         let x = x_of(i);
-        t.head.push(q15(0.5
-            * (1.0
-                + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0)))));
+        t.head.push(quant(
+            0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0))),
+        ));
         i += 1;
     }
     let mut j = n;
@@ -677,11 +815,9 @@ fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
     }
     for idx in j..n {
         let x = x_of(idx);
-        t.tail.push(q15(0.5
-            * (1.0
-                + math::cos(
-                    core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0),
-                ))));
+        t.tail.push(quant(
+            0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0))),
+        ));
     }
     t
 }
@@ -1179,10 +1315,10 @@ fn regrow(buf: &mut Vec<u64>, len: usize) {
 /// multiply-add is a 32×32→64 multiply and an add instead of two soft-float
 /// calls (the stage was 57–78 % of an ESP32-S3 encode;
 /// docs/plans/esp32-encoder-cost.md item 2).
-fn autocorrelation(
+fn autocorrelation<T: TaperWord>(
     samples: &[i32],
     max_order: usize,
-    win: Window,
+    win: Window<'_, T>,
     scratch: &mut EncodeScratch,
 ) -> u32 {
     // Windowed samples and the autocorrelation output are both encoder-owned
@@ -1191,27 +1327,28 @@ fn autocorrelation(
     let w = &mut scratch.words;
     let (h, t, n) = (win.head.len(), win.tail.len(), samples.len());
     regrow(w, n);
-    // Normalisation shift, from the samples: |x| = |s|·q < 2^(bits(s) + 15),
+    // Normalisation shift, from the samples: |x| = |s|·q < 2^(bits(s) + Q),
     // so `x >> sh` is at most 2^b in magnitude. (Derived from the samples
     // rather than from a pass over the products, and fused into the one
     // windowing pass below.)
     let lg = usize::BITS - n.saturating_sub(1).leading_zeros(); // ⌈log2 n⌉
     let b = (62 - lg) / 2;
     let big = samples.iter().fold(0u32, |a, &s| a | s.unsigned_abs());
-    let sh = (u32::BITS - big.leading_zeros() + WIN_Q).saturating_sub(b);
-    // |s| <= 2^31 (32-bit encode), q <= 2^15: every s·q fits i64 with room.
+    let q_bits = T::Q;
+    let sh = (u32::BITS - big.leading_zeros() + q_bits).saturating_sub(b);
+    // |s| <= 2^31 (32-bit encode), q <= 2^30: every s·q fits i64.
     w.extend(
         samples[..h]
             .iter()
             .zip(win.head)
-            .map(|(&s, &q)| ((s as i64 * q as i64) >> sh) as u64),
+            .map(|(&s, &q)| ((s as i64 * q.widen()) >> sh) as u64),
     );
-    // The flat middle, (s << 15) >> sh, as one shift of s.
-    if sh <= WIN_Q {
-        let up = WIN_Q - sh;
+    // The flat middle, (s << Q) >> sh, as one shift of s.
+    if sh <= q_bits {
+        let up = q_bits - sh;
         w.extend(samples[h..n - t].iter().map(|&s| ((s as i64) << up) as u64));
     } else {
-        let down = sh - WIN_Q;
+        let down = sh - q_bits;
         w.extend(
             samples[h..n - t]
                 .iter()
@@ -1222,13 +1359,13 @@ fn autocorrelation(
         samples[n - t..]
             .iter()
             .zip(win.tail)
-            .map(|(&s, &q)| ((s as i64 * q as i64) >> sh) as u64),
+            .map(|(&s, &q)| ((s as i64 * q.widen()) >> sh) as u64),
     );
     let mut sums = [0i64; 33];
     let sums = &mut sums[..=max_order];
     autocorr_int(w, sums);
-    // x = s·w·2^(15−sh), so Σ x·x' = Σ (s·w)(s'·w') · 2^(30−2sh).
-    let scale = pow2(2 * sh as i32 - 2 * WIN_Q as i32);
+    // x = s·w·2^(Q−sh), so Σ x·x' = Σ (s·w)(s'·w') · 2^(2Q−2sh).
+    let scale = pow2(2 * sh as i32 - 2 * q_bits as i32);
     let autoc = &mut scratch.autoc;
     autoc.clear();
     autoc.extend(sums.iter().map(|&v| v as f64 * scale));
@@ -2349,6 +2486,11 @@ fn write_subframe_from(
 // |sample| <= 2^31, see `autocorrelation`), Levinson, quantization and the
 // partition planner. Nothing here runs for bps <= 24.
 
+/// Highest LPC order the wide path searches. 32-bit streams are never
+/// subset, so FLAC's 32 would be legal, but on a 384 kHz / 32-bit track 16
+/// saved only 0.5% for 25% more encode time.
+const WIDE_MAX_ORDER: usize = LPC_MAX_ORDER;
+
 /// Largest residual magnitude (exclusive) the wide path codes.
 const WIDE_RES_LIMIT: u64 = 1 << 30;
 
@@ -2454,58 +2596,326 @@ fn lpc_residual_wide(samples: &[i32], qlp: &[i32], shift: i32) -> Option<Vec<i32
     }
 }
 
-/// Why a wide LPC candidate could not be realized.
-enum WideLpcFail {
-    /// Quantization left no predictive power.
-    Degenerate,
-    /// Some residual reaches [`WIDE_RES_LIMIT`].
-    TooWide,
+/// A quantized wide LPC predictor with its exact residual, not yet
+/// partition-planned; `est` is its Rice-estimated subframe size.
+struct WideResidual {
+    order: usize,
+    qlp: Vec<i32>,
+    shift: i32,
+    res: Vec<i32>,
+    est: u64,
 }
 
-/// [`realize_lpc`] on the wide path: quantize, i64 residual, partition plan.
-fn realize_lpc_wide(
+fn wide_lpc_header_bits(order: usize, bps: u32) -> u64 {
+    // hdr(8) + warm-up + precision(4) + shift(5) + coeffs + residual hdr(6).
+    8 + order as u64 * bps as u64 + 4 + 5 + order as u64 * WIDE_LPC_PRECISION as u64 + 6
+}
+
+impl WideResidual {
+    fn plan(self, n: usize, bps: u32, scratch: &mut EncodeScratch) -> LpcCandidate {
+        let plan = plan_partitions(&self.res, n, self.order, scratch);
+        LpcCandidate {
+            order: self.order,
+            precision: WIDE_LPC_PRECISION,
+            bits: wide_lpc_header_bits(self.order, bps) + plan.bits,
+            qlp: self.qlp,
+            shift: self.shift,
+            res: self.res,
+            plan,
+        }
+    }
+}
+
+/// How many of [`SEG_WINDOWS`] the wide path tries at a compression level
+/// (given as its LPC order cap).
+fn wide_seg_windows(max_lpc_order: usize) -> usize {
+    if max_lpc_order >= 12 {
+        SEG_WINDOWS.len() // partial (2), (3) and punchout (3)
+    } else if max_lpc_order >= 8 {
+        5 // partial (2) and (3)
+    } else {
+        0
+    }
+}
+
+/// Windowed autocorrelations (lags `0..=max_order`) of every window the wide
+/// path tries: the two full-block Tukey windows, then the first `seg_windows`
+/// of [`SEG_WINDOWS`] (when the block is large enough). Each piece's
+/// autocorrelation is computed once and shared by the windows containing it.
+fn wide_autocs(
+    samples: &[i32],
+    max_order: usize,
+    seg_windows: usize,
+    wins: &WindowCache,
+    scratch: &mut EncodeScratch,
+) -> Vec<[f64; WIDE_MAX_ORDER + 1]> {
+    let n = samples.len();
+    let set = wins.wide();
+    let lags = max_order + 1;
+    let mut out = Vec::with_capacity(2 + SEG_WINDOWS.len());
+    for k in 0..WINDOW_ALPHAS.len() {
+        autocorrelation(samples, max_order, set.full[k].view(), &mut *scratch);
+        let mut a = [0.0f64; WIDE_MAX_ORDER + 1];
+        a[..lags].copy_from_slice(&scratch.autoc[..lags]);
+        out.push(a);
+    }
+    if set.pieces.is_empty() {
+        return out;
+    }
+    let mut piece_autoc: [Option<[f64; WIDE_MAX_ORDER + 1]>; PIECES.len()] = [None; PIECES.len()];
+    for parts in &SEG_WINDOWS[..seg_windows.min(SEG_WINDOWS.len())] {
+        let mut autoc = [0.0f64; WIDE_MAX_ORDER + 1];
+        for &p in *parts {
+            let pa = piece_autoc[p].get_or_insert_with(|| {
+                let (d, i, j) = PIECES[p];
+                let seg = &samples[n * i / d..n * j / d];
+                autocorrelation(seg, max_order, set.pieces[p].view(), &mut *scratch);
+                let mut a = [0.0f64; WIDE_MAX_ORDER + 1];
+                a[..lags].copy_from_slice(&scratch.autoc[..lags]);
+                a
+            });
+            for (acc, &v) in autoc[..lags].iter_mut().zip(&pa[..lags]) {
+                *acc += v;
+            }
+        }
+        out.push(autoc);
+    }
+    out
+}
+
+/// Levinson-Durbin keeping every order's predictor coefficients:
+/// `coeffs[o - 1][..o]` for orders `1..=found` (returned). Same recursion as
+/// [`levinson_errs`] / [`levinson_coeffs`].
+fn levinson_all(
+    autoc: &[f64],
+    max_order: usize,
+    coeffs: &mut [[f64; WIDE_MAX_ORDER]; WIDE_MAX_ORDER],
+) -> usize {
+    let mut lpc = [0.0f64; WIDE_MAX_ORDER];
+    let mut err = autoc[0];
+    let mut found = 0usize;
+    for i in 0..max_order {
+        if err <= 0.0 {
+            break;
+        }
+        let mut r = -autoc[i + 1];
+        for j in 0..i {
+            r -= lpc[j] * autoc[i - j];
+        }
+        r /= err;
+        lpc[i] = r;
+        for j in 0..(i / 2) {
+            let tmp = lpc[j];
+            lpc[j] = tmp + r * lpc[i - 1 - j];
+            lpc[i - 1 - j] += r * tmp;
+        }
+        if i & 1 == 1 {
+            lpc[i / 2] += r * lpc[i / 2];
+        }
+        err *= 1.0 - r * r;
+        for (c, &l) in coeffs[i].iter_mut().zip(&lpc[..=i]) {
+            *c = -l;
+        }
+        found = i + 1;
+    }
+    found
+}
+
+/// Exact sums for the residual energy of any predictor of order `p <= maxp`
+/// on one block: `Σ_{t=p}^{n-1} (Σ_i a_i x_{t-i})² = Σ_ij a_i a_j C_ij` with
+/// `C_ij = Σ_{t=p}^{n-1} x_{t-i} x_{t-j}`, which is the full lag sum `S_k`
+/// (`k = |i - j|`) minus the products before `t = p` (`head`) and past the
+/// block's end (`tail`). All i128 and exact: on oversampled content the
+/// residual energy is ~2^-40 of the signal's, a cancellation an f64 would not
+/// survive.
+struct WideCov {
+    /// `maxp + 1`, the row length of `head` and `tail`.
+    w: usize,
+    /// `S_k = Σ_{u=k}^{n-1} x_u x_{u-k}`.
+    lag: Vec<i128>,
+    /// `head[k·w + m] = Σ_{u=k}^{m-1} x_u x_{u-k}` (`k <= m <= maxp`).
+    head: Vec<i128>,
+    /// `tail[k·w + i] = Σ_{u=n-i}^{n-1} x_u x_{u-k}` (`i <= maxp`).
+    tail: Vec<i128>,
+}
+
+impl WideCov {
+    /// Needs `x.len() >= 2 * maxp`.
+    fn new(x: &[i32], maxp: usize) -> WideCov {
+        let n = x.len();
+        debug_assert!(n >= 2 * maxp);
+        let w = maxp + 1;
+        // |x| <= 2^31: each product is at most 2^62 and exact in i64; sums
+        // of them are taken in i128.
+        let prod = |u: usize, k: usize| (x[u] as i64 * x[u - k] as i64) as i128;
+        let mut c = WideCov {
+            w,
+            lag: vec![0; w],
+            head: vec![0; w * w],
+            tail: vec![0; w * w],
+        };
+        for k in 0..=maxp {
+            c.lag[k] = x[k..]
+                .iter()
+                .zip(&x[..n - k])
+                .map(|(&a, &b)| (a as i64 * b as i64) as i128)
+                .sum();
+            for m in k + 1..=maxp {
+                c.head[k * w + m] = c.head[k * w + m - 1] + prod(m - 1, k);
+            }
+            for i in 1..=maxp {
+                c.tail[k * w + i] = c.tail[k * w + i - 1] + prod(n - i, k);
+            }
+        }
+        c
+    }
+
+    /// `C_ij` for an order-`p` predictor.
+    #[inline(always)]
+    fn c(&self, p: usize, i: usize, j: usize) -> i128 {
+        let (i, j) = if i <= j { (i, j) } else { (j, i) };
+        let k = j - i;
+        self.lag[k] - self.head[k * self.w + p - i] - self.tail[k * self.w + i]
+    }
+
+    /// Residual energy of the quantized predictor `qlp`, `shift` (the
+    /// decoder's floor, under 1 per sample, is ignored).
+    fn energy(&self, qlp: &[i32], shift: i32) -> f64 {
+        let p = qlp.len();
+        let mut a = [0i64; WIDE_MAX_ORDER + 1];
+        a[0] = 1i64 << shift;
+        for (ai, &q) in a[1..].iter_mut().zip(qlp) {
+            *ai = -(q as i64);
+        }
+        let a = &a[..=p];
+        let mut e = 0i128;
+        for (i, &ai) in a.iter().enumerate() {
+            let row: i128 = a
+                .iter()
+                .enumerate()
+                .map(|(j, &aj)| aj as i128 * self.c(p, i, j))
+                .sum();
+            e += ai as i128 * row;
+        }
+        // |a| <= 2^15 and |C| <= 2^74: at most 13² terms of 2^104, far inside
+        // i128. A sum of squares, so never negative.
+        e as f64 * pow2(-2 * shift)
+    }
+}
+
+/// At most this many of the best energy-ranked LPC candidates get their
+/// exact residual computed, and only those within [`WIDE_REALIZE_MARGIN`] of
+/// the best estimate. On a 384 kHz / 32-bit track 1 / 2 / 4 gave 326.31 /
+/// 326.23 / 326.21 MB; realizing every candidate is several times slower.
+const WIDE_REALIZE_MAX: usize = 2;
+const WIDE_REALIZE_MARGIN: f64 = 0.01;
+
+/// The best wide LPC subframe and the window it came from (index into
+/// [`wide_autocs`]). Every window's predictor at every order
+/// `1..=max_order` is quantized and ranked by [`WideCov::energy`], the
+/// exact residual energy of the *quantized* predictor. The float Levinson
+/// error cannot rank them: on oversampled content the predictors are sharp
+/// (coefficients up to ~60), and quantization costs some of them far more
+/// than others. The best few get their exact residual, re-ranked by a Rice
+/// estimate; those within 2% of the best get partition plans.
+fn wide_best_lpc(
     samples: &[i32],
     bps: u32,
-    est: &LpcEstimate,
+    max_order: usize,
+    seg_windows: usize,
+    wins: &WindowCache,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
-) -> Result<LpcCandidate, WideLpcFail> {
+) -> Option<(usize, LpcCandidate)> {
     let n = samples.len();
-    let order = est.order;
-    let Some((qlp, shift)) = quantize_lpc(&est.coeffs, WIDE_LPC_PRECISION) else {
-        stats.lpc_quantize_failed += 1;
-        return Err(WideLpcFail::Degenerate);
-    };
-    let res = lpc_residual_wide(samples, &qlp, shift).ok_or(WideLpcFail::TooWide)?;
-    let plan = plan_partitions(&res, n, order, scratch);
-    let bits = 8
-        + order as u64 * bps as u64
-        + 4
-        + 5
-        + order as u64 * WIDE_LPC_PRECISION as u64
-        + 6
-        + plan.bits;
-    Ok(LpcCandidate {
-        order,
-        precision: WIDE_LPC_PRECISION,
-        qlp,
-        shift,
-        res,
-        plan,
-        bits,
-    })
+    let autocs = wide_autocs(samples, max_order, seg_windows, wins, scratch);
+    let cov = WideCov::new(samples, max_order);
+
+    struct Cand {
+        est: f64,
+        widx: usize,
+        qlp: Vec<i32>,
+        shift: i32,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut coeffs = [[0.0f64; WIDE_MAX_ORDER]; WIDE_MAX_ORDER];
+    for (widx, autoc) in autocs.iter().enumerate() {
+        if autoc[0] <= 0.0 {
+            continue;
+        }
+        let found = levinson_all(&autoc[..=max_order], max_order, &mut coeffs);
+        if found < max_order {
+            stats.lpc_levinson_exhausted += 1;
+        }
+        for o in 1..=found {
+            let Some((qlp, shift)) = quantize_lpc(&coeffs[o - 1][..o], WIDE_LPC_PRECISION) else {
+                continue;
+            };
+            let m = (n - o) as f64;
+            let e = cov.energy(&qlp, shift);
+            let est = wide_lpc_header_bits(o, bps) as f64 + m * (0.5 * math::log2(e / m)).max(0.0);
+            cands.push(Cand {
+                est,
+                widx,
+                qlp,
+                shift,
+            });
+        }
+    }
+    cands.sort_by(|a, b| a.est.total_cmp(&b.est));
+
+    // Realize residuals best-first: up to WIDE_REALIZE_MAX within the margin
+    // of the best estimate, and past them (whatever the margin) only until
+    // one residual fits 30 bits.
+    let best_est = cands.first()?.est;
+    let mut resids: Vec<(usize, WideResidual)> = Vec::new();
+    for (rank, c) in cands.into_iter().enumerate() {
+        let close =
+            rank < WIDE_REALIZE_MAX && c.est <= best_est + best_est.abs() * WIDE_REALIZE_MARGIN;
+        if !close && !resids.is_empty() {
+            break;
+        }
+        let Some(res) = lpc_residual_wide(samples, &c.qlp, c.shift) else {
+            continue; // too wide
+        };
+        let order = c.qlp.len();
+        let abs: u64 = res.iter().map(|&r| r.unsigned_abs() as u64).sum();
+        let est = wide_lpc_header_bits(order, bps) + rice_bits_estimate(abs, res.len() as u64);
+        resids.push((
+            c.widx,
+            WideResidual {
+                order,
+                qlp: c.qlp,
+                shift: c.shift,
+                res,
+                est,
+            },
+        ));
+    }
+    let best_rice = resids.iter().map(|(_, r)| r.est).min()?;
+    let mut best: Option<(usize, LpcCandidate)> = None;
+    for (widx, r) in resids {
+        if r.est > best_rice + best_rice / 50 {
+            continue;
+        }
+        let c = r.plan(n, bps, &mut *scratch);
+        if best.as_ref().is_none_or(|(_, b)| c.bits < b.bits) {
+            best = Some((widx, c));
+        }
+    }
+    best
 }
 
 /// Subframe choice for bit depths above 24 (no stereo decorrelation, so every
-/// value stays within 32 bits): CONSTANT, LPC (both windows, order capped by
-/// the compression level), FIXED 0..=4, or VERBATIM. Same selection rules as
-/// the narrow path: the estimated LPC window winner is realized (and a
-/// runner-up within [`WINDOW_EST_MARGIN`]); FIXED is realized only when its
-/// estimate is within 10% of the best so far. LPC or FIXED candidates whose
-/// residuals do not fit 30 bits are skipped.
+/// value stays within 32 bits): CONSTANT, LPC ([`wide_best_lpc`]: the
+/// level's windows, every order up to its cap), FIXED 0..=4, or VERBATIM.
+/// FIXED is realized only when its estimate is within 10% of the best so far,
+/// as on the narrow path. LPC or FIXED candidates whose residuals do not fit
+/// 30 bits are skipped.
 fn analyze_wide(
     arm: &ArmInput<'_>,
     max_lpc_order: usize,
+    seg_windows: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
@@ -2529,40 +2939,14 @@ fn analyze_wide(
         kind: SubframeKind::Verbatim,
     };
 
-    // LPC. A predictor whose residual does not fit 30 bits (a high order on
-    // near-full-scale content can overshoot) makes that candidate ineligible;
-    // if every window's candidate fails that way, the order cap is halved and
-    // the search re-run, so a level with a higher cap never ends up worse off
-    // than one with a lower cap merely because its first choice was too wide.
-    let mut max_order = max_lpc_order.min(n / 2);
-    while max_order >= 1 {
+    // LPC: every (window, order) candidate, ranked by the exact energy of
+    // its quantized predictor's residual; only the best few are realized.
+    let max_order = max_lpc_order.min(n / 2).min(WIDE_MAX_ORDER);
+    if max_order >= 1 {
         debug_assert_eq!(wins.n, n, "window cache not sized for this block");
-        let ests: Vec<Option<LpcEstimate>> = (0..WINDOW_ALPHAS.len())
-            .map(|k| lpc_estimate(samples, bps, max_order, wins.get(k), stats, &mut *scratch))
-            .collect();
-        let winner = ests
-            .iter()
-            .flatten()
-            .map(|e| e.est_bits)
-            .fold(f64::INFINITY, f64::min);
-        let mut lpc: Option<(usize, LpcCandidate)> = None;
-        let mut too_wide = false;
-        for (widx, est) in ests.iter().enumerate() {
-            let Some(est) = est else { continue };
-            if est.est_bits > winner * (1.0 + WINDOW_EST_MARGIN) {
-                continue; // clear loser: skip the expensive realization
-            }
-            match realize_lpc_wide(samples, bps, est, stats, &mut *scratch) {
-                Ok(c) => {
-                    if lpc.as_ref().is_none_or(|(_, b)| c.bits < b.bits) {
-                        lpc = Some((widx, c));
-                    }
-                }
-                Err(WideLpcFail::TooWide) => too_wide = true,
-                Err(WideLpcFail::Degenerate) => {}
-            }
-        }
-        if let Some((widx, c)) = lpc {
+        if let Some((widx, c)) =
+            wide_best_lpc(samples, bps, max_order, seg_windows, wins, stats, scratch)
+        {
             if c.bits + wb < best.bits {
                 if widx == 1 {
                     stats.lpc_window_second_won += 1;
@@ -2573,13 +2957,7 @@ fn analyze_wide(
                     kind: SubframeKind::Lpc(Box::new(c)),
                 };
             }
-            break;
         }
-        if !too_wide {
-            break;
-        }
-        let tried = ests.iter().flatten().map(|e| e.order).max().unwrap_or(1);
-        max_order = tried / 2;
     }
 
     // FIXED, cheapest estimate first; a too-wide residual falls through to the
@@ -2793,6 +3171,80 @@ mod tests {
         let edge = [0, (1 << 30) - 1, 0, -(1 << 30) + 1];
         assert!(fixed_residual_wide(&edge, 0).is_some());
         assert!(fixed_residual_wide(&[0, 1 << 30], 0).is_none());
+    }
+
+    /// [`WideCov::energy`] is the quantized predictor's residual energy
+    /// exactly: every order, on full-scale 32-bit content and on a block just
+    /// long enough for the order, against the sum taken directly in i128.
+    #[test]
+    fn wide_cov_energy_is_exact() {
+        let mut x = 99u64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32 as i32
+        };
+        for n in [24usize, 25, 500, BLOCK_SIZE] {
+            let mut s: Vec<i32> = (0..n).map(|_| rnd()).collect();
+            s[0] = i32::MIN;
+            s[n - 1] = i32::MAX;
+            let cov = WideCov::new(&s, LPC_MAX_ORDER);
+            for p in 1..=LPC_MAX_ORDER {
+                // Extreme coefficients: the largest |a| the quantizer emits.
+                let qlp: Vec<i32> = (0..p)
+                    .map(|j| match j % 3 {
+                        0 => (1 << 14) - 1,
+                        1 => -(1 << 14),
+                        _ => rnd() >> 18,
+                    })
+                    .collect();
+                for shift in [0, 9, 15] {
+                    let mut want = 0i128;
+                    for t in p..n {
+                        let mut r = (s[t] as i128) << shift;
+                        for (j, &q) in qlp.iter().enumerate() {
+                            r -= q as i128 * s[t - 1 - j] as i128;
+                        }
+                        want += r * r;
+                    }
+                    let want = want as f64 * pow2(-2 * shift);
+                    assert_eq!(cov.energy(&qlp, shift), want, "n={n} p={p} shift={shift}");
+                }
+            }
+        }
+    }
+
+    /// The wide path's Q30 windows: the autocorrelation tracks the float one
+    /// on full-scale 32-bit content, for the full-block windows and a piece.
+    #[test]
+    fn wide_autocorrelation_tracks_float() {
+        let n = BLOCK_SIZE;
+        let s: Vec<i32> = (0..n)
+            .map(|i| (2.1e9 * (i as f64 * 0.003).sin() + 1e5 * (i as f64 * 1.7).cos()) as i32)
+            .collect();
+        let mut cache = WindowCache {
+            wide: true,
+            ..WindowCache::default()
+        };
+        cache.ensure(n);
+        let set = cache.wide();
+        assert_eq!(set.pieces.len(), PIECES.len());
+        let mut scratch = EncodeScratch::default();
+        let mut check = |seg: &[i32], win: Window<'_, u32>, alpha: f64| {
+            let want = autocorr_f64(seg, &tukey_window(seg.len(), alpha), 12);
+            autocorrelation(seg, 12, win, &mut scratch);
+            for (lag, (&got, &w)) in scratch.autoc.iter().zip(&want).enumerate() {
+                let err = (got - w).abs() / want[0];
+                // The 25-bit normalisation leaves ~1e-9; Q15 windows ~1e-5.
+                assert!(err < 1e-7, "len={} lag={lag}: {got} vs {w}", seg.len());
+            }
+        };
+        for (k, &alpha) in WINDOW_ALPHAS.iter().enumerate() {
+            check(&s, set.full[k].view(), alpha);
+        }
+        let (d, i, j) = PIECES[3];
+        check(&s[n * i / d..n * j / d], set.pieces[3].view(), PIECE_ALPHA);
     }
 
     /// The tapers are the full-length window's non-1.0 samples in Q15, and
